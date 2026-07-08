@@ -1,0 +1,39 @@
+name = "flowmails-receive-worker"
+main = "src/index.js"
+compatibility_date = "2025-06-04"
+keep_vars = true
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 100
+
+#[[d1_databases]]
+#binding = "db"			#d1数据库绑定名默认不可修改
+#database_name = ""		#d1数据库名字
+#database_id = ""		#d1数据库id
+
+#[[kv_namespaces]]
+#binding = "kv"			#kv绑定名默认不可修改
+#id = ""					#kv数据库id
+
+#[[r2_buckets]]
+#binding = "r2"			#r2对象存储绑定名默认不可修改
+#bucket_name = ""		#r2对象存储桶的名字
+
+[triggers]
+crons = ["0 16 * * *"]	#定时任务每天晚上12点执行
+
+[[send_email]]
+name = "EMAIL"
+
+#[vars]
+#orm_log = false
+#domain = []				#邮件域名可可配置多个 示例: ["example1.com","example2.com"]
+#admin = ""				#管理员的邮箱	示例: admin@example.com
+#JWT_SECRET = ""			#jwt令牌的密钥,随便填一串字符串
+#VERSION = "1.1.9"					#程序版本号
+
+
+

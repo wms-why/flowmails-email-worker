@@ -1,0 +1,36 @@
+name = "flowmails-dev"
+main = "src/index.js"
+compatibility_date = "2025-06-04"
+keep_vars = true
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 100
+
+[dev]
+ip = "0.0.0.0"
+
+[[d1_databases]]
+binding = "db"
+database_name = "flowmails-db"
+database_id = "a4c1a63a-6ef5-4e6d-8e8c-b6d9e8feb810"
+
+[[kv_namespaces]]
+binding = "kv"
+id = "2io01d4b299e481b9de060ece9e7785c"
+
+[[r2_buckets]]
+binding = "r2"
+bucket_name = "flowmails-bucket"
+
+[[send_email]]
+name = "EMAIL"
+
+
+[vars]
+orm_log = false
+JWT_SECRET = "b7f29a1d-18e2-4d3b-941f-f6b2c97c02fd"
+VERSION = "1.1.9"					#程序版本号
+FLOWMAILS_HOST="flowmails.net"
