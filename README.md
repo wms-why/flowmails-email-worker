@@ -4,6 +4,10 @@ Cloudflare Worker that receives inbound email for [Flowmails](https://flowmails.
 
 This package is the per-account receive-worker that Flowmails deploys once per `(user, accountId)` pair onto the user's own Cloudflare account.
 
+## About Flowmails
+
+[Flowmails](https://flowmails.net) is a Cloudflare-native email platform: custom-domain mail (inbox, outbox, and routing rules) that lives in your own D1, with a REST API and webhooks on top. The dashboard, docs, and blog live at **<https://flowmails.net>** — sign up there to create an account and bind your custom domain before this worker is deployed against it.
+
 ## Quick start
 
 ```bash
