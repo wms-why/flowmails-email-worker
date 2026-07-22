@@ -67,6 +67,128 @@ function compareVersion(v1, v2) {
  */
 const VERSION_MIGRATION = [
 	{
+		// 1.2.0 — add the `junk_email` sink for inbound messages
+		// the Rspamd check classifies as spam or phishing. Receive
+		// flow saves the row to `email` as usual, then runs the
+		// Rspamd classifier in `ctx.waitUntil` and, on
+		// `action === "reject"`, deletes the row from `email` and
+		// inserts it here with the spam fields stamped on. Restore
+		// goes the other way.
+		//
+		// Schema mirrors `email` minus the conversation-thread
+		// columns (junk is rarely threaded) plus the Rspamd
+		// scoring fields. The address-part split expressions are
+		// the same shape used in `entity/email.js` and
+		// `entity/junk-email.js` — Drizzle reads the same
+		// expression off the entity when generating queries, so a
+		// drift between the three would corrupt the index entries.
+		version: '1.2.0',
+		exec: async (c) => {
+			await c.env.db
+				.prepare(
+					`
+			CREATE TABLE IF NOT EXISTS junk_email (
+				id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+				from_email TEXT NOT NULL,
+				from_local TEXT GENERATED ALWAYS AS (
+					CASE WHEN instr(from_email, '@') > 0
+					     THEN substr(from_email, 1, instr(from_email, '@') - 1)
+					     ELSE from_email END
+				) VIRTUAL,
+				from_domain TEXT GENERATED ALWAYS AS (
+					CASE WHEN instr(from_email, '@') > 0
+					     THEN substr(from_email, instr(from_email, '@') + 1)
+					     ELSE '' END
+				) VIRTUAL,
+				from_name TEXT,
+				to_email TEXT NOT NULL DEFAULT '',
+				to_local TEXT GENERATED ALWAYS AS (
+					CASE WHEN instr(to_email, '@') > 0
+					     THEN substr(to_email, 1, instr(to_email, '@') - 1)
+					     ELSE to_email END
+				) VIRTUAL,
+				to_domain TEXT GENERATED ALWAYS AS (
+					CASE WHEN instr(to_email, '@') > 0
+					     THEN substr(to_email, instr(to_email, '@') + 1)
+					     ELSE '' END
+				) VIRTUAL,
+				to_name TEXT,
+				subject TEXT,
+				text TEXT,
+				content TEXT,
+				cc TEXT DEFAULT '[]',
+				bcc TEXT DEFAULT '[]',
+				recipient TEXT,
+				message_id TEXT DEFAULT '',
+				in_reply_to TEXT DEFAULT '',
+				type TEXT DEFAULT 'receive' NOT NULL,
+				status INTEGER DEFAULT 0 NOT NULL,
+				unread INTEGER DEFAULT 1 NOT NULL,
+				create_time DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+				spam_score REAL NOT NULL,
+				spam_action TEXT NOT NULL,
+				spam_required_score REAL NOT NULL,
+				spam_symbols TEXT,
+				spam_checked_at INTEGER NOT NULL
+			)
+		`,
+				)
+				.run();
+
+			// Junk list / count: same partial-index shape as
+			// `idx_email_inbox`. The leading column is the
+			// indexed `to_domain` virtual column; `id DESC`
+			// matches the worker's `ORDER BY id DESC LIMIT ?`
+			// list query without a sort step.
+			await c.env.db
+				.prepare(
+					`CREATE INDEX IF NOT EXISTS idx_junk_email_to_domain
+						ON junk_email(to_domain, id DESC)`,
+				)
+				.run();
+
+			// Restore path looks the junk row up by `message_id`
+			// when re-attaching to a conversation chain on the
+			// live table (rare, but cheap to keep covered).
+			await c.env.db
+				.prepare(
+					`CREATE INDEX IF NOT EXISTS idx_junk_email_message_id
+						ON junk_email(message_id)`,
+				)
+				.run();
+
+			// Add `junk_email_id` to `attachments` so junk rows
+			// can carry their attachments through the
+			// `email` → `junk_email` swap without a separate
+			// `junk_attachments` table. `email_id` stays NOT
+			// NULL — when an attachment is moved into the
+			// junk state we keep `email_id` pointing at the
+			// (now-deleted) original email row and stamp the
+			// `junk_email_id` instead; on restore we rewrite
+			// `email_id` to the new live row. `deleteJunk`
+			// cascades by `junk_email_id`, so the row only
+			// leaves the table when the user actually purges
+			// the junk row.
+			await c.env.db
+				.prepare(
+					`ALTER TABLE attachments ADD COLUMN junk_email_id INTEGER`,
+				)
+				.run();
+
+			// The junk-state attachment lookup is the only
+			// non-trivial read path on `junk_email_id` (used
+			// by the cascade-delete helper). Cheap to keep
+			// covered.
+			await c.env.db
+				.prepare(
+					`CREATE INDEX IF NOT EXISTS idx_attachments_junk_email_id
+						ON attachments(junk_email_id)
+						WHERE junk_email_id IS NOT NULL`,
+				)
+				.run();
+		},
+	},
+	{
 		// 1.1.9 — drop the `email.thread_position` column. The
 		// field was write-only — the worker stamped a depth number
 		// at insert time, but no query (not the inbox list, not

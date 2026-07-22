@@ -33,7 +33,8 @@ name = "EMAIL"
 #domain = []				#邮件域名可可配置多个 示例: ["example1.com","example2.com"]
 #admin = ""				#管理员的邮箱	示例: admin@example.com
 #JWT_SECRET = ""			#jwt令牌的密钥,随便填一串字符串
-#VERSION = "1.1.9"					#程序版本号
+#VERSION = "1.2.0"					#程序版本号
+#RSPAMD_CHECK_URL = "https://flowmail.net/api/check"   # 1.2.0 — inbound Rspamd classifier
 
 
 

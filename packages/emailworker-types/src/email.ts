@@ -617,6 +617,156 @@ export type EmailAttachmentListRequest = {
 export type EmailAttachmentListResponse = AttachmentRow[];
 
 // ---------------------------------------------------------------------------
+// Junk folder (1.2.0+).
+//
+// Inbound messages that the Rspamd check classifies as spam or
+// phishing are moved out of the live `email` table into a parallel
+// `junk_email` table on the same D1. The worker stamps the spam
+// scoring metadata onto the junk row so the UI can show "why was this
+// flagged" and the user can decide to restore it (which copies the row
+// back into `email` with the spam fields stripped).
+//
+// Attachments ride along on the regular `attachments` table —
+// migration 1.2.0 added a `junk_email_id` companion column so a
+// single row can be parented to either `email` or `junk_email`.
+// `markAsJunk` stamps the new column; `restoreFromJunk` rewrites
+// `email_id` to the freshly-inserted live row and clears
+// `junk_email_id`; `deleteJunk` cascades through
+// `attService.removeByJunkEmailIds` so the R2 object is dropped in
+// lockstep with the junk row. The Junk tab UI still doesn't render
+// attachments (V1 intentionally keeps the surface narrow) but
+// restoring a row brings its attachments back automatically.
+//
+// /api/email/junkList      GET    paginated list (same shape as /email/list)
+// /api/email/junkRestore   POST   copy a junk row back into `email`
+// /api/email/junkDelete    DELETE hard-delete one or more junk rows
+// /api/email/countJunk     POST   per-domain unread-junk totals
+// ---------------------------------------------------------------------------
+
+/**
+ * Row shape for the junk folder. Mirrors {@link EmailListRow} but
+ * omits `threadId` (junk mail is rarely threaded and we don't keep
+ * the parent-link column on the junk table) and adds the Rspamd
+ * scoring fields. `attList` is always empty — see the file-level
+ * note above.
+ */
+export type EmailJunkListRow = {
+  /** Auto-increment row id on the `junk_email` table. */
+  id: number;
+
+  // Sender addressing
+  fromEmail: string;
+  fromLocal: string;
+  fromDomain: string;
+  fromName: string | null;
+
+  // Recipient addressing
+  toEmail: string;
+  toLocal: string;
+  toDomain: string;
+  toName: string | null;
+
+  // Content
+  subject: string | null;
+  text: string | null;
+  content: string | null;
+
+  // Multi-recipient metadata
+  cc: string;
+  bcc: string;
+  recipient: string | null;
+
+  // Conversation threading (kept for fidelity; junk rows are not
+  // surfaced in the conversation thread query, but the upstream
+  // Message-ID / In-Reply-To are preserved so a restored row can
+  // re-attach to a chain).
+  messageId: string;
+  inReplyTo: string;
+
+  // Routing / state
+  status: EmailStatus;
+  unread: EmailUnreadFlag;
+  /** SQL `CURRENT_TIMESTAMP`; string, not a number. */
+  createTime: string;
+  /** Junk rows are never starred from the emailbox UI. */
+  isStar: 0;
+  /** Always empty — see the file-level note above. */
+  attList: never[];
+
+  // Rspamd scoring metadata (always present; the worker stamps
+  // them at the moment of move-to-junk).
+  /** Numeric score returned by Rspamd. */
+  spamScore: number;
+  /** Rspamd's verdict string — `"reject"`, `"add header"`, `"greylist"`,
+   * `"ham"`, or one of its other action labels. The classification
+   * rule is "junk ⇔ action === 'reject'", but the raw value is
+   * exposed so the UI can show why something was flagged. */
+  spamAction: string;
+  /** Score at which Rspamd would have rejected the message. */
+  spamRequiredScore: number;
+  /** JSON-encoded `Record<symbolName, { score, description }>` so
+   * the UI can surface the top contributors. */
+  spamSymbols: string | null;
+  /** Unix epoch (ms) of when the score was recorded. */
+  spamCheckedAt: number;
+};
+
+/** Query parameters for `GET /api/email/junkList`. */
+export type EmailJunkListRequest = EmailWorkerPaginationParams & {
+  /** Bare domain name. The worker filters on `to_domain = ?` (junk
+   * rows are always inbound, so the recipient's domain is the right
+   * indexed column). */
+  domain: string;
+  /** Same repeated `to=` shape as {@link EmailListRequest}. */
+  to?: string[];
+};
+
+/** Response payload for `/api/email/junkList`. */
+export type EmailJunkListResponse = {
+  list: EmailJunkListRow[];
+  total: number;
+};
+
+/** Proxy-side args for {@link listJunk}. */
+export type EmailJunkListArgs = Omit<
+  EmailJunkListRequest,
+  "to" | "domain"
+> & {
+  domainId: string;
+  localparts?: string[];
+};
+
+/** Request body for `POST /api/email/junkRestore`. */
+export type EmailJunkRestoreRequest = {
+  /** Junk row id to restore. */
+  junkId: number;
+  /** Bare domain name; the worker uses it as the IDOR scope (the
+   * row's `toDomain` must match). */
+  domain: string;
+};
+
+/**
+ * Response payload for `/api/email/junkRestore`. The worker deletes
+ * the junk row and inserts a fresh row in `email` with the spam
+ * fields stripped. Returns the new email row id so the UI can jump
+ * the user to it. Attachments are not restored (see the file-level
+ * note above).
+ */
+export type EmailJunkRestoreResponse = {
+  /** Newly-inserted `email.id` on the live table. */
+  emailId: number;
+};
+
+/** Query parameters for `DELETE /api/email/junkDelete`. */
+export type EmailJunkDeleteRequest = {
+  /** One or more junk row ids; comma-separated or repeated. */
+  junkIds: number[] | string;
+};
+
+/** Response payload for `/api/email/junkDelete`. The worker emits `data: null`. */
+export type EmailJunkDeleteResponse = Record<string, never>;
+
+// ---------------------------------------------------------------------------
 // /api/email/countUnread (POST, multi-domain)
 // ---------------------------------------------------------------------------
 
@@ -632,6 +782,24 @@ export type EmailCountUnreadRequest = {
  * can render a complete map.
  */
 export type EmailCountUnreadResponse = Record<string, number>;
+
+// ---------------------------------------------------------------------------
+// /api/email/countJunk (POST, multi-domain)
+// ---------------------------------------------------------------------------
+
+/** Request body for `POST /api/email/countJunk`. */
+export type EmailCountJunkRequest = {
+  /** Domains to total. Same placeholder-chunking contract as
+   * {@link EmailCountUnreadRequest}. */
+  domains: string[];
+};
+
+/**
+ * Per-domain unread-junk totals. Drives the Junk-tab badge so the
+ * user can see at a glance how many flagged messages are waiting
+ * to be reviewed. Domains with no unread junk rows return `0`.
+ */
+export type EmailCountJunkResponse = Record<string, number>;
 
 // ---------------------------------------------------------------------------
 // /api/email/countUnreadByDomain (GET, single domain)

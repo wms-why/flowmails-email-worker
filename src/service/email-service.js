@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gt, inArray, count, lt, sql } from 'drizzle-orm';
 import { parseHTML } from 'linkedom';
 import email from '../entity/email';
 import { EmailConst } from '../entity/email';
+import junkEmail from '../entity/junk-email';
 import orm from '../entity/orm';
 import { t } from '../i18n/i18n';
 import BizError from '../utils/biz-error';
@@ -819,6 +820,312 @@ const emailService = {
 		// is a single indexed range scan on the
 		// `(to_domain) WHERE count > 0` partial index.
 		return unreadcountService.listByDomain(c.env, domain);
+	},
+
+	// -------------------------------------------------------------------------
+	// Junk folder (1.2.0+).
+	//
+	// Inbound messages that the Rspamd classifier marks as spam or
+	// phishing (`action === "reject"`) get moved out of the live
+	// `email` table into `junk_email`. Two write paths support the
+	// move:
+	//
+	//   - `markAsJunk` — called from the async spam-check pipeline
+	//     that runs in `ctx.waitUntil` after a successful save.
+	//     Order is INSERT-junk → re-parent attachments (stamp
+	//     `junk_email_id`) → cascade-delete the live row. Doing
+	//     the INSERT first means a partial failure leaves a
+	//     recoverable duplicate (the user can clean up via the
+	//     UI) rather than a silently-deleted real email.
+	//
+	//   - `restoreFromJunk` — the user clicks "Not junk" from the
+	//     Junk tab. INSERT-live → re-parent attachments (rewrite
+	//     `email_id` to the new row, clear `junk_email_id`) →
+	//     DELETE-junk. Same safety reasoning as `markAsJunk`;
+	//     the restored row gets the spam fields stripped and a
+	//     fresh thread anchor (resolved from the upstream
+	//     `message_id` / `in_reply_to`).
+	//
+	// Attachments ride along on the `attachments` table —
+	// migration 1.2.0 added `junk_email_id` so a single row can
+	// be parented to either table. `deleteJunk` cascades through
+	// `attService.removeByJunkEmailIds` to drop both the row and
+	// its R2 object in lockstep.
+	// -------------------------------------------------------------------------
+
+	async markAsJunk(env, emailId, spamResult) {
+		// 1. Pull the row so we have everything to copy. If the
+		//    row is already gone (a concurrent delete, a duplicate
+		//    classifier call, etc.) just bail — there's nothing
+		//    to mark.
+		const row = await orm(env).select().from(email).where(eq(email.id, emailId)).get();
+		if (!row) {
+			return { moved: false, reason: 'row not found' };
+		}
+
+		// 2. Build the junk row. Spam fields come from the
+		//    classifier response; everything else is copied
+		//    verbatim. `status` and `unread` are preserved so the
+		//    Junk tab UI can surface the same row state the user
+		//    would have seen in Inbox.
+		const junkRow = {
+			fromEmail: row.fromEmail,
+			fromName: row.fromName,
+			toEmail: row.toEmail,
+			toName: row.toName,
+			subject: row.subject,
+			text: row.text,
+			content: row.content,
+			cc: row.cc,
+			bcc: row.bcc,
+			recipient: row.recipient,
+			messageId: row.messageId,
+			inReplyTo: row.inReplyTo,
+			type: row.type,
+			status: row.status,
+			unread: row.unread,
+			createTime: row.createTime,
+			spamScore: spamResult.score,
+			spamAction: spamResult.action,
+			spamRequiredScore: spamResult.requiredScore,
+			spamSymbols: spamResult.symbols,
+			spamCheckedAt: Date.now(),
+		};
+
+		// 3. INSERT into junk_email FIRST. If this fails the live
+		//    row stays in place — the classifier can retry on
+		//    the next receive, and the user sees nothing weird.
+		await orm(env).insert(junkEmail).values(junkRow).run();
+
+		// 4. Re-parent the attachments onto the new junk row.
+		//    The `attachments` table keeps a single row per
+		//    attachment — we stamp `junk_email_id` so the R2
+		//    object survives the move and `deleteJunk` can
+		//    cascade it later. `email_id` is intentionally
+		//    left alone: with the live `email` row about to be
+		//    deleted, no query path will look it up by
+		//    `email_id` again, and rewriting it to NULL would
+		//    require dropping the `NOT NULL` constraint on a
+		//    table that already has rows on upgrade.
+		await env.db
+			.prepare(
+				`UPDATE attachments SET junk_email_id = ? WHERE email_id = ?`,
+			)
+			.bind(emailId, emailId)
+			.run();
+
+		// 5. Cascade-delete from the live table. Stars have no
+		//    junk-side counterpart (junk rows are never starred
+		//    from the emailbox UI), so they get the same
+		//    starService.removeByEmailIds path as the live
+		//    inbox's `batchDelete`. Unread-count cache is
+		//    decremented against the snapshot taken BEFORE the
+		//    row drops so the badge can't transiently read low.
+		const toEmails = await this._selectUnreadToEmails({ env }, eq(email.id, emailId));
+		await starService.removeByEmailIds({ env }, [emailId]);
+		await orm(env).delete(email).where(eq(email.id, emailId)).run();
+		await unreadcountService.batchedDecrement(env, toEmails);
+
+		return { moved: true, junkRowId: junkRow.id ?? null };
+	},
+
+	async restoreFromJunk(c, params) {
+		const { junkId, domain } = params;
+		const numericId = Number(junkId);
+		if (!numericId) {
+			throw new BizError('junkId is required');
+		}
+		if (!domain) {
+			throw new BizError('domain is required');
+		}
+
+		// 1. Pull the junk row. IDOR check: the row's
+		//    `toDomain` must match the domain the caller claims
+		//    to own. Mirrors the contract on `getOne` so a
+		//    cross-domain caller never sees another account's
+		//    junk row.
+		const row = await orm(c.env).select().from(junkEmail).where(eq(junkEmail.id, numericId)).get();
+		if (!row) {
+			throw new BizError(t('notExistEmailReply'));
+		}
+		if (row.toDomain !== domain) {
+			throw new BizError(t('notExistEmailReply'));
+		}
+
+		// 2. Build the live-email row. Spam fields are
+		//    intentionally dropped — `unread` resets to UNREAD
+		//    (the restored row surfaces as a fresh inbox
+		//    notification), `status` resets to RECEIVE, and the
+		//    thread anchor is re-derived from the upstream
+		//    `messageId` / `inReplyTo` so it lines up with the
+		//    live `email` table's threading rules.
+		const emailRow = {
+			fromEmail: row.fromEmail,
+			fromName: row.fromName,
+			toEmail: row.toEmail,
+			toName: row.toName,
+			subject: row.subject,
+			text: row.text,
+			content: row.content,
+			cc: row.cc,
+			bcc: row.bcc,
+			recipient: row.recipient,
+			messageId: row.messageId,
+			inReplyTo: row.inReplyTo,
+			type: row.type,
+			status: EmailConst.status.RECEIVE,
+			unread: EmailConst.unread.UNREAD,
+		};
+		const { threadId } = await this.resolveThreadId(c.env, emailRow);
+		emailRow.threadId = threadId;
+
+		// 3. INSERT into email FIRST. Same safety reasoning as
+		//    `markAsJunk` — if the next step fails we have a
+		//    recoverable duplicate (deleteable from the Junk
+		//    tab) instead of a silently-lost restored row.
+		const inserted = await orm(c.env).insert(email).values(emailRow).returning().get();
+		await unreadcountService.increment(c.env, inserted.toEmail);
+
+		// 4. Re-parent the attachments onto the new live row.
+		//    `email_id` is rewritten to the freshly-inserted
+		//    `email.id` so subsequent list/get endpoints see
+		//    them again; `junk_email_id` is cleared because
+		//    the row no longer belongs to the junk folder.
+		//    We do this BEFORE dropping the junk row so a
+		//    partial failure leaves both rows addressable.
+		await c.env.db
+			.prepare(
+				`UPDATE attachments SET email_id = ?, junk_email_id = NULL WHERE junk_email_id = ?`,
+			)
+			.bind(inserted.id, numericId)
+			.run();
+
+		// 5. Drop the junk row.
+		await orm(c.env).delete(junkEmail).where(eq(junkEmail.id, numericId)).run();
+
+		return { emailId: inserted.id };
+	},
+
+	async listJunk(c, params) {
+		// Junk mailbox list. Mirrors the `list()` shape (page +
+		// total) but reads from `junk_email`. Junk rows are
+		// always inbound, so the recipient-side columns are
+		// always populated and we filter on `to_domain` /
+		// `to_local` (same compound partial-index path as the
+		// inbox list).
+		let { size } = params;
+		const { domain, emailId, to } = params;
+
+		size = Number(size);
+		if (size > 30) size = 30;
+
+		const conditions = [];
+		if (emailId) {
+			conditions.push(gt(junkEmail.id, Number(emailId)));
+		}
+		if (domain) {
+			conditions.push(eq(junkEmail.toDomain, domain));
+		}
+		if (Array.isArray(to) && to.length > 0) {
+			const toList = to.map((s) => String(s ?? '').trim()).filter(Boolean);
+			if (toList.length > 0) {
+				conditions.push(inArray(junkEmail.toLocal, toList));
+			}
+		}
+
+		const listQuery = orm(c.env)
+			.select()
+			.from(junkEmail)
+			.where(conditions.length > 0 ? and(...conditions) : undefined)
+			.orderBy(desc(junkEmail.id))
+			.limit(size)
+			.all();
+
+		const totalQuery = orm(c.env)
+			.select({ total: count(junkEmail.id) })
+			.from(junkEmail)
+			.where(conditions.length > 0 ? and(...conditions) : undefined)
+			.get();
+
+		const [list, totalRow] = await Promise.all([listQuery, totalQuery]);
+		return { list, total: totalRow ? totalRow.total : 0 };
+	},
+
+	async deleteJunk(c, params) {
+		// Hard delete by junk-id. The attachments row carries
+		// the parent `junk_email_id` (stamped by `markAsJunk`),
+		// so the same cascade shape as the live inbox's
+		// `batchDelete` applies — except routed through
+		// `attService.removeByJunkEmailIds` which filters on
+		// `junk_email_id` instead of `email_id`. R2 objects
+		// (and the shared-key dedup logic in `removeAttByField`)
+		// are picked up automatically by that helper.
+		//
+		// Order matters: cascade attachments BEFORE dropping
+		// the junk row so a partial failure leaves the row
+		// still addressable (the user can retry). Stars don't
+		// need a parallel cascade — junk rows are never
+		// starred from the emailbox UI, so the `star` table
+		// has no rows pointing at a junk id.
+		//
+		// Chunking: each id feeds 2 statements into
+		// `removeAttByField`'s `db.batch([...])` call, plus one
+		// place per id in the final `inArray(...)` DELETE. D1's
+		// per-statement placeholder cap (~100 by default) caps
+		// the DELETE, and the db.batch size limit caps the
+		// cascade. Process in 64-id chunks — same number as
+		// `countJunkByDomains` / `countUnreadByDomains` — so
+		// a multi-select purge of thousands of junk rows never
+		// trips either ceiling.
+		const rawIds = params.junkIds;
+		const ids = (Array.isArray(rawIds) ? rawIds : String(rawIds ?? '').split(','))
+			.map((s) => Number(String(s).trim()))
+			.filter((n) => Number.isFinite(n) && n > 0);
+		if (ids.length === 0) {
+			return;
+		}
+		const CHUNK = 64;
+		for (let i = 0; i < ids.length; i += CHUNK) {
+			const slice = ids.slice(i, i + CHUNK);
+			await attService.removeByJunkEmailIds(c, slice);
+			await orm(c.env).delete(junkEmail).where(inArray(junkEmail.id, slice)).run();
+		}
+	},
+
+	async countJunkByDomains(c, domains) {
+		// Per-domain unread-junk totals for the Junk-tab badge.
+		// Same chunking contract as `countUnreadByDomains`:
+		// chunk at 64 placeholders (D1's safe per-statement bound),
+		// missing domains report as 0.
+		//
+		// Chunks run in parallel via `Promise.all` — each chunk is an
+		// independent read against `idx_junk_email_domain_unread`, so
+		// they share no state and fan out cleanly. The previous
+		// serial loop added N × round-trip latency for free; with
+		// ~3 chunks the wall-clock drops to a single round-trip.
+		if (!domains || domains.length === 0) return {};
+		const CHUNK = 64;
+		const slices = [];
+		for (let i = 0; i < domains.length; i += CHUNK) {
+			slices.push(domains.slice(i, i + CHUNK));
+		}
+		const chunkResults = await Promise.all(
+			slices.map((slice) => {
+				const placeholders = Array.from({ length: slice.length }, (_, k) => `?${k + 1}`).join(',');
+				const sql = `SELECT to_domain AS toDomain, COUNT(*) AS total FROM junk_email WHERE to_domain IN (${placeholders}) AND unread = 1 GROUP BY to_domain`;
+				return c.env.db.prepare(sql).bind(...slice).all();
+			}),
+		);
+		const result = {};
+		for (const { results } of chunkResults) {
+			for (const row of results) {
+				result[row.toDomain] = row.total;
+			}
+		}
+		for (const domain of domains) {
+			if (result[domain] === undefined) result[domain] = 0;
+		}
+		return result;
 	},
 };
 

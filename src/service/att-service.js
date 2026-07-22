@@ -156,6 +156,16 @@ const attService = {
 		await this.removeAttByField(c, 'email_id', emailIds);
 	},
 
+	// 1.2.0 — symmetric to `removeByEmailIds` but filters on
+	// `junk_email_id`. Used by `emailService.deleteJunk` to
+	// cascade attachments + their R2 objects when the user
+	// purges a junk row (or a bulk of them). Lives on the same
+	// `attachments` table as live-email attachments — see
+	// migration 1.2.0 for the schema rationale.
+	async removeByJunkEmailIds(c, junkEmailIds) {
+		await this.removeAttByField(c, 'junk_email_id', junkEmailIds);
+	},
+
 	selectByEmailIds(c, emailIds) {
 		return orm(c.env)
 			.select()
