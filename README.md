@@ -6,7 +6,7 @@ This package is the per-account receive-worker that Flowmails deploys once per `
 
 ## About Flowmails
 
-[Flowmails](https://flowmails.net) is a Cloudflare-native email platform: custom-domain mail (inbox, outbox, and routing rules) that lives in your own D1, with a REST API and webhooks on top. The dashboard, docs, and blog live at **<https://flowmails.net>** — sign up there to create an account and bind your custom domain before this worker is deployed against it.
+[Flowmails](https://flowmails.net) is a self-hosted email API on Cloudflare — your inbox, outbox, and webhooks live in your own D1, no SMTP relay needed. The dashboard, docs, and blog live at **<https://flowmails.net>** — sign up there to create an account and bind your custom domain before this worker is deployed against it.
 
 ## Quick start
 
