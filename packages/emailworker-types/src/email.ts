@@ -209,6 +209,13 @@ export type EmailListRow = {
   unread: EmailUnreadFlag;
   /** SQL `CURRENT_TIMESTAMP`; string, not a number. */
   createTime: string;
+  /**
+   * Relay-side error string for send rows whose `status === 8`
+   * (FAILED). The worker writes the SMTP error message into
+   * `email.send_feedback` at the moment the send fails; rows that
+   * succeeded leave it null. Always `null` for receive rows.
+   */
+  sendFeedback: string | null;
 
   // Worker-computed fields -----------------------------------------------
   /** `1` if the row appears in the `star` table, else `0`. */
@@ -325,6 +332,9 @@ export type EmailThreadRow = {
   status: EmailStatus;
   unread: EmailUnreadFlag;
   createTime: string;
+  /** Same as `EmailListRow.sendFeedback`; see that field for the wire
+   * contract. Always `null` for receive rows. */
+  sendFeedback: string | null;
   isStar: 0 | 1;
   attList: AttachmentInList[];
   /** Threading metadata, preserved so the client can render the chain structure. */
@@ -546,6 +556,13 @@ export type EmailSendResult = {
   /** Always `0` in this projection — the worker doesn't join the `star` table. */
   isStar: 0;
   attList: AttachmentInList[];
+  /**
+   * Relay-side error string when `status === 8` (FAILED). The
+   * worker writes the SMTP error message into
+   * `email.send_feedback` at the moment the send fails; `null`
+   * when the row succeeded.
+   */
+  sendFeedback: string | null;
 };
 
 /** Convenience alias for the response shape of `/api/email/send`. */

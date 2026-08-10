@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, count, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, count, like, lt, or, sql } from 'drizzle-orm';
 import { parseHTML } from 'linkedom';
 import email from '../entity/email';
 import { EmailConst } from '../entity/email';
@@ -181,6 +181,7 @@ const emailService = {
 				status: email.status,
 				unread: email.unread,
 				createTime: email.createTime,
+				sendFeedback: email.sendFeedback,
 				textPreview: sql`COALESCE(SUBSTR(${email.text}, 1, ${TEXT_PREVIEW_LEN}), '')`,
 				contentPreview: sql`COALESCE(SUBSTR(${email.content}, 1, ${CONTENT_PREVIEW_LEN}), '')`,
 				bodyTruncated: sql`CASE WHEN LENGTH(IFNULL(${email.text}, '')) > ${TEXT_PREVIEW_LEN} OR LENGTH(IFNULL(${email.content}, '')) > ${CONTENT_PREVIEW_LEN} THEN 1 ELSE 0 END`,
@@ -209,6 +210,7 @@ const emailService = {
 				status: email.status,
 				unread: email.unread,
 				createTime: email.createTime,
+				sendFeedback: email.sendFeedback,
 				textPreview: sql`COALESCE(SUBSTR(${email.text}, 1, ${TEXT_PREVIEW_LEN}), '')`,
 				contentPreview: sql`COALESCE(SUBSTR(${email.content}, 1, ${CONTENT_PREVIEW_LEN}), '')`,
 				bodyTruncated: sql`CASE WHEN LENGTH(IFNULL(${email.text}, '')) > ${TEXT_PREVIEW_LEN} OR LENGTH(IFNULL(${email.content}, '')) > ${CONTENT_PREVIEW_LEN} THEN 1 ELSE 0 END`,
@@ -373,6 +375,20 @@ const emailService = {
 			.select({ toEmail: email.toEmail })
 			.from(email)
 			.where(and(whereFragment, eq(email.unread, EmailConst.unread.UNREAD)))
+			.all();
+		return rows.map((row) => row.toEmail);
+	},
+
+	// Inverse of `_selectUnreadToEmails` — used by `markUnread` to
+	// snapshot the rows that are CURRENTLY read, so the cache update
+	// only bumps counters for rows that genuinely flipped. Same
+	// `WHERE` fragment contract as the unread variant; callers pass
+	// an arbitrary additional filter (e.g. `inArray(email.id, [...])`).
+	async _selectReadToEmails(c, whereFragment) {
+		const rows = await orm(c.env)
+			.select({ toEmail: email.toEmail })
+			.from(email)
+			.where(and(whereFragment, eq(email.unread, EmailConst.unread.READ)))
 			.all();
 		return rows.map((row) => row.toEmail);
 	},
@@ -644,6 +660,12 @@ const emailService = {
 			createTime: row.createTime,
 			isStar: 0,
 			attList,
+			// The SMTP / relay error string when this row's send
+			// attempt failed (`status === 8`); null otherwise. The
+			// `dispatchOutbound` failure path writes
+			// `error.message` into `email.send_feedback` at the
+			// moment the relay rejects the envelope.
+			sendFeedback: row.sendFeedback || null,
 		};
 	},
 
@@ -803,6 +825,142 @@ const emailService = {
 		const toEmails = await this._selectUnreadToEmails(c, inArray(email.id, emailIds));
 		await orm(c.env).update(email).set({ unread: EmailConst.unread.READ }).where(inArray(email.id, emailIds));
 		await unreadcountService.batchedDecrement(c.env, toEmails);
+	},
+
+	// Inverse of `read()`: flips `unread = 1` for the given ids and
+	// bumps the per-mailbox counter via `batchedIncrement`. Same order
+	// as `read()` — mutate the row first, then update the cache — so
+	// a dropped cache update leaves the count high (recoverable) not
+	// low (user-visible undercount). The `batchedIncrement` upsert is
+	// its own idempotency guard: re-running on an already-unread row
+	// just adds another count, which `count()` would inflate. That's
+	// why we snapshot FIRST (`_selectReadToEmails` filters on
+	// `unread = READ`) and only bump counters for rows whose flag
+	// genuinely flipped, mirroring the snapshot-then-mutate order in
+	// `read()`. See CLAUDE.md "unreadcount invariant" Working Rule.
+	async markUnread(c, params) {
+		const { emailIds } = params;
+		const toEmails = await this._selectReadToEmails(c, inArray(email.id, emailIds));
+		await orm(c.env).update(email).set({ unread: EmailConst.unread.UNREAD }).where(inArray(email.id, emailIds));
+		await unreadcountService.batchedIncrement(c.env, toEmails);
+	},
+
+	// Substring filter across subject / from / to / body for a single
+	// domain. Mirrors `list()`'s indexed access path
+	// (`(to|from)_domain, id DESC`) and adds a `LIKE %q%` post-filter
+	// on top, so the search hits the partial B-tree first and the
+	// LIKE scan only walks the page window. No FTS5 — sufficient for
+	// personal mailbox sizes; the wire shape deliberately matches
+	// `/email/list` so a future move to FTS5 (or a Rust extension)
+	// needs only the worker implementation to change, not the
+	// contract. `field` defaults to `body`, which is a 5-column OR
+	// (subject / from / to / text / content). The proxy is
+	// responsible for rejecting queries shorter than 2 chars; we
+	// additionally short-circuit here so a direct worker call
+	// can't issue a full-table scan.
+	async search(c, params) {
+		let { size } = params;
+		const { type, domain, emailId, to, q, field } = params;
+
+		size = Number(size);
+		const typeValue = type === 'send' ? 'send' : 'receive';
+		if (size > 30) size = 30;
+
+		const searchTerm = String(q ?? '').trim();
+		if (searchTerm.length < 2) {
+			return { list: [], total: 0 };
+		}
+
+		const conditions = [eq(email.type, typeValue)];
+
+		if (emailId) {
+			conditions.push(gt(email.id, Number(emailId)));
+		}
+
+		if (domain) {
+			const domainColumn = typeValue === 'send' ? email.fromDomain : email.toDomain;
+			conditions.push(eq(domainColumn, domain));
+		}
+
+		if (Array.isArray(to) && to.length > 0) {
+			const toList = to.map((s) => String(s ?? '').trim()).filter(Boolean);
+			if (toList.length > 0) {
+				const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
+				conditions.push(inArray(localColumn, toList));
+			}
+		}
+
+		// Escape `%` / `_` / `\` so a literal underscore doesn't match
+		// every row. The SQL `ESCAPE '\'` clause makes the doubled
+		// backslash the escape character so Drizzle can bind the term
+		// as a single parameter (`${escaped}` -> `?N`) per LIKE clause.
+		const escaped = searchTerm.replace(/[\\%_]/g, (m) => '\\' + m);
+		const likePattern = sql`'%' || ${escaped} || '%' ESCAPE '\\'`;
+
+		if (field === 'subject') {
+			conditions.push(like(email.subject, likePattern));
+		} else if (field === 'from') {
+			conditions.push(like(email.fromEmail, likePattern));
+		} else if (field === 'to') {
+			conditions.push(like(email.toEmail, likePattern));
+		} else {
+			// Default `body` — OR across subject / from / to / text / content.
+			conditions.push(
+				or(
+					like(email.subject, likePattern),
+					like(email.fromEmail, likePattern),
+					like(email.toEmail, likePattern),
+					like(email.text, likePattern),
+					like(email.content, likePattern),
+				),
+			);
+		}
+
+		const listQuery = orm(c.env)
+			.select()
+			.from(email)
+			.where(and(...conditions))
+			.orderBy(desc(email.id))
+			.limit(size)
+			.all();
+
+		const totalQuery = orm(c.env)
+			.select({ total: count(email.id) })
+			.from(email)
+			.where(and(...conditions))
+			.get();
+
+		const [listResult, totalRow] = await Promise.all([listQuery, totalQuery]);
+		let list = listResult;
+
+		const emailIds = list.map((item) => item.id);
+
+		const starList = await starService.selectByEmailIds(c, emailIds);
+		const starredEmailIds = new Set(starList.map((item) => item.emailId));
+
+		list = list.map((item) => ({
+			...item,
+			isStar: starredEmailIds.has(item.id) ? 1 : 0,
+		}));
+
+		const attsList = await attService.selectByEmailIds(c, emailIds);
+
+		list.forEach((emailRow) => {
+			let r2domain = '';
+			if (emailRow.type === 'receive') {
+				r2domain = getR2Domain(emailRow.toEmail);
+			} else if (emailRow.type === 'send') {
+				r2domain = getR2Domain(emailRow.fromEmail);
+			}
+
+			const atts = attsList.filter((attsRow) => {
+				attsRow.url = `https://${r2domain}/${attsRow.key}`;
+				return attsRow.emailId === emailRow.id;
+			});
+			emailRow.attList = atts;
+		});
+
+		return { list, total: totalRow.total };
 	},
 
 	async countUnreadByDomains(c, domains) {
