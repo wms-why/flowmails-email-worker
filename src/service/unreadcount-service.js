@@ -77,6 +77,21 @@ const unreadcountService = {
 		await env.db.batch(stmts);
 	},
 
+	// Bulk increment for a list of (toEmail) values — used by
+	// `markUnread()` after the caller has already selected which rows
+	// were read+live. Reuses `UPSERT_SQL` (identical semantics to the
+	// single-row `increment` path) with `db.batch` for the multi-row
+	// case, deduping before binding. The upsert is the idempotency
+	// guard: re-running on an already-tracked mailbox just adds
+	// another count, but `markUnread` snapshots FIRST (only rows
+	// whose flag flipped) so a duplicate entry is benign.
+	async batchedIncrement(env, toEmails) {
+		const unique = [...new Set(toEmails.filter(Boolean))];
+		if (unique.length === 0) return;
+		const stmts = unique.map((toEmail) => env.db.prepare(UPSERT_SQL).bind(toEmail));
+		await env.db.batch(stmts);
+	},
+
 	// Per-recipient unread map for a single domain — preserves the
 	// pre-rewrite contract of `countUnreadByDomain`.
 	async listByDomain(env, domain) {

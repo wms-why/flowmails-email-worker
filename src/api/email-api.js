@@ -14,6 +14,19 @@ app.get('/email/list', async (c) => {
   return c.json(result.ok(data));
 });
 
+app.get('/email/search', async (c) => {
+  // Substring filter across subject / from / to / body. No FTS5 —
+  // the worker's `search()` service applies a SQL `LIKE %q%` after
+  // the indexed access path. `to` is repeated for the localpart
+  // multi-select same as `/email/list`. The proxy is responsible
+  // for trimming `q` to a minimum 2 chars so a stray keystroke
+  // doesn't issue a full-table scan.
+  const params = c.req.query();
+  const to = c.req.queries('to');
+  const data = await emailService.search(c, { ...params, to });
+  return c.json(result.ok(data));
+});
+
 app.get('/email/thread', async (c) => {
   // Conversation thread resolver. The web client passes the email
   // id of the message the user just clicked; we walk the inReplyTo /
@@ -73,6 +86,15 @@ app.post('/email/send', async (c) => {
 
 app.put('/email/read', async (c) => {
   await emailService.read(c, await c.req.json());
+  return c.json(result.ok());
+});
+
+// Inverse of `/email/read`: flips `unread = 1` for the given ids and
+// bumps the per-mailbox counter (order matters — see `markUnread` for
+// the invariant). Used by the emailbox "Mark as unread" affordance;
+// also the bulk-mark-unread path on the multi-select toolbar.
+app.put('/email/unread', async (c) => {
+  await emailService.markUnread(c, await c.req.json());
   return c.json(result.ok());
 });
 
