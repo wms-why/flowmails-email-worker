@@ -1,0 +1,61 @@
+# Local development / test bindings.
+#
+# The production config (`wrangler.toml`) deliberately leaves D1 / KV /
+# R2 commented out — the per-account receive-worker uploaded by
+# `apps/web`'s `deployWorker` supplies real binding ids at upload time.
+# Local miniflare and `@cloudflare/vitest-pool-workers` need concrete
+# placeholders, so they live here instead.
+#
+# Referenced by `package.json#dev` and `vitest.config.js`.
+name = "flowmails-receive-worker-dev"
+main = "src/index.js"
+compatibility_date = "2025-06-04"
+
+[observability]
+enabled = true
+
+[limits]
+cpu_ms = 100
+
+# `src/entity/orm.js` binds every table to `db`; `bootstrap-service.js`
+# creates the schema on the first `/api/bootstrap` call.
+[[d1_databases]]
+binding = "db"
+database_name = "flowmails-dev-db"
+database_id = "00000000-0000-4000-8000-000000000000"
+
+# `flowmails-kv` is the account-level namespace `deployWorker` creates and
+# binds as `kv`. It backs `LAST_VERSION` migrations, `SEND_DAY_COUNT`, and
+# the per-domain receive route table (`route_rules:<domain>` — see
+# `src/service/route-service.js`). The id below is a local placeholder;
+# miniflare never talks to the real namespace.
+[[kv_namespaces]]
+binding = "kv"
+id = "00000000000000000000000000000000"
+
+[[r2_buckets]]
+binding = "r2"
+bucket_name = "flowmails-dev-bucket"
+
+[triggers]
+crons = ["0 16 * * *"]
+
+[[send_email]]
+name = "EMAIL"
+
+[vars]
+VERSION = "1.4.0"
+# Local-only secret. `service/security.js` compares the request's
+# `Authorization` header against `Bearer ${JWT_SECRET}` literally.
+JWT_SECRET = "local-dev-jwt-secret"
+orm_log = false
+domain = ["example.com"]
+admin = "admin@example.com"
+# Set to the dev classifier when working on the inbound spam path.
+# RSPAMD_CHECK_URL = ""
+
+# NOTE: no `[assets]` section. `src/index.js` falls through to
+# `env.assets.fetch(req)` for non-`/api` paths, so that branch needs the
+# binding. Nothing in the API surface or the test suite touches it, and
+# the production `wrangler.toml` has no assets either — add a `public/`
+# directory and an `[assets]` block here if a dev front-end is ever needed.

@@ -28,3 +28,4 @@ export * from "./email.ts";
 export * from "./ai-agent.ts";
 export * from "./analysis.ts";
 export * from "./bootstrap.ts";
+export * from "./route.ts";

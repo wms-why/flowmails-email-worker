@@ -9,4 +9,5 @@ import '../api/r2-api';
 import '../api/bootstrap-api';
 import '../api/analysis-api';
 import '../api/ai-agent-api';
+import '../api/route-api';
 export default app;

@@ -5,6 +5,7 @@ import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
 import attService from './att-service';
 import emailService from './email-service';
+import routeService from './route-service';
 import rspamdService from './rspamd-service';
 import { getR2Domain } from '../utils/r2-utils';
 
@@ -16,8 +17,24 @@ import { getR2Domain } from '../utils/r2-utils';
 // for any text-only spam check payload.
 const MAX_RSPAMD_BODY_BYTES = 25 * 1024 * 1024;
 
+// 550 5.1.1 是标准的「用户不存在」，比 5.7.1 (policy) 更贴近真实
+// 原因，也避免把「这个域名用了白名单」这件事透给发件方。
+const ROUTE_REJECT_REASON = '550 5.1.1 No such user at this domain';
+
 export async function email(message, env, ctx) {
 	try {
+		// 路由判定必须**先于任何正文解析**：`message.raw` 是一次性
+		// ReadableStream，这里早退还能顺带省掉大附件的 arrayBuffer。
+		// Cloudflare 侧现在对该域名只保留一条 catch-all → worker 的
+		// 规则，「哪些 localpart 收信」完全由 KV 里的路由表决定
+		// (见 `route-service.js`)。判定失败一律放行
+		// (route-service 内部 fail-open)，基础设施抖动不会变成丢信。
+		const decision = await routeService.decide(env, message.to);
+		if (decision.action === 'reject') {
+			message.setReject(ROUTE_REJECT_REASON);
+			return;
+		}
+
 		// Read the raw RFC822 source ONCE into a string so we can
 		// (a) feed it to PostalMime for parsing and (b) hand it
 		// to the Rspamd classifier later without re-reading
