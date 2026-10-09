@@ -89,6 +89,22 @@ app.put('/email/read', async (c) => {
   return c.json(result.ok());
 });
 
+// Bulk "Mark all as read" for a mailbox **scope** rather than an id
+// list: `PUT /api/email/readAll` with `{ domain, to? }`, where `to`
+// is the same repeated localpart field `/email/list` accepts (the
+// web proxy composes full `local@domain` addresses into it; the
+// service strips the domain back off before matching `to_local`).
+// Omitting `to` means every mailbox on the domain. Resolves to
+// `{ updated: <row count> }`.
+//
+// Added in 1.4.2 — a worker older than this answers a plain 404 on
+// this path (Hono has no such route), which the platform proxy maps
+// to an upgrade hint rather than a generic gateway error.
+app.put('/email/readAll', async (c) => {
+  const data = await emailService.readAll(c, await c.req.json());
+  return c.json(result.ok(data));
+});
+
 // Inverse of `/email/read`: flips `unread = 1` for the given ids and
 // bumps the per-mailbox counter (order matters — see `markUnread` for
 // the invariant). Used by the emailbox "Mark as unread" affordance;

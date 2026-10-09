@@ -4,6 +4,7 @@ import email from '../entity/email';
 import { EmailConst } from '../entity/email';
 import junkEmail from '../entity/junk-email';
 import orm from '../entity/orm';
+import { star } from '../entity/star';
 import { t } from '../i18n/i18n';
 import BizError from '../utils/biz-error';
 import emailUtils from '../utils/email-utils';
@@ -14,18 +15,52 @@ import unreadcountService from './unreadcount-service';
 import { getR2Domain } from '../utils/r2-utils';
 import verifyUtils from '../utils/verify-utils';
 
+// ---------------------------------------------------------------------------
+// Mailbox paging bounds (1.5.0)
+//
+// Every list endpoint (`list`, `search`, `listJunk`) pages through the
+// same bounds so a caller can't ask one mailbox for 500 rows and
+// another for 30 and get two different shapes back.
+//
+// The important part is the *absent* case. The old guard was
+// `if (size > 30) size = 30`, which is an upper bound and nothing
+// else: a caller that omitted `size` left it as `Number(undefined)`
+// = `NaN`, and `NaN > 30` is false, so `NaN` survived all the way
+// into Drizzle's `buildLimit` — whose guard is
+// `typeof limit === 'number' && limit >= 0`, also false for `NaN`.
+// The LIMIT clause was therefore **omitted entirely** and the query
+// returned the whole mailbox. `resolvePageSize` replaces the guard
+// with a full normaliser so "no `size`" means "the default page",
+// never "no limit".
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 100;
+
+/**
+ * Normalise a `size` query param into a usable page cap.
+ *
+ * Non-finite / non-positive / absent → `DEFAULT_PAGE_SIZE`.
+ * Anything larger than `MAX_PAGE_SIZE` is clamped down, so the
+ * value the platform's pager divides by always matches the value
+ * the worker actually applied.
+ *
+ * @param {unknown} raw
+ * @returns {number} an integer in `[1, MAX_PAGE_SIZE]`
+ */
+function resolvePageSize(raw) {
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n <= 0) return DEFAULT_PAGE_SIZE;
+	return Math.min(Math.floor(n), MAX_PAGE_SIZE);
+}
+
 const emailService = {
 	async list(c, params) {
-		let { size } = params;
-		const { type, domain, emailId, to } = params;
+		const size = resolvePageSize(params.size);
+		const { type, domain, emailId, to, starred } = params;
 
-		size = Number(size);
 		// type 统一使用字符串
 		const typeValue = type === 'send' ? 'send' : 'receive';
-
-		if (size > 30) {
-			size = 30;
-		}
 
 		const conditions = [eq(email.type, typeValue)];
 
@@ -62,6 +97,23 @@ const emailService = {
 				const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
 				conditions.push(inArray(localColumn, toList));
 			}
+		}
+
+		// Starred filter (1.5.0). The web client used to page the
+		// Starred tab by loading the *entire* inbox and narrowing on
+		// `isStar` in the browser, which is why every inbox page was
+		// unbounded. This pushes the predicate down instead: a
+		// semi-join against the `star` table, expressed as
+		// `id IN (SELECT email_id FROM star)` so it composes with the
+		// rest of the `conditions` array — which means the `total`
+		// count below is scoped to starred rows too, and the pager's
+		// `total` is the starred count rather than the mailbox count.
+		//
+		// Only `starred=1` filters; anything else (absent, `0`,
+		// garbage) is the unstarred mailbox, matching the old
+		// client-side "show everything, star or not" behaviour.
+		if (starred === '1' || starred === 1 || starred === true) {
+			conditions.push(inArray(email.id, orm(c.env).select({ emailId: star.emailId }).from(star)));
 		}
 
 		const listQuery = orm(c.env)
@@ -827,6 +879,107 @@ const emailService = {
 		await unreadcountService.batchedDecrement(c.env, toEmails);
 	},
 
+	// Mark **every** unread inbound message in a scope as read — the
+	// emailbox "Mark all as read" affordance. Unlike `read()`, which
+	// needs the caller to hand us an explicit id list (and therefore
+	// can only ever cover the page the user happens to have loaded),
+	// this takes the same scope the inbox list is built from and flips
+	// it in one statement:
+	//
+	//   - `type = receive` — outbound rows are inserted with
+	//     `unread = 0` anyway, and the unread cache is scoped to
+	//     inbound receives only (see CLAUDE.md "unreadcount
+	//     invariant"), so touching them would be a no-op at best.
+	//   - `to_domain = <domain>` — the IDOR boundary. The caller is
+	//     authenticated per-worker, so the domain it passes is already
+	//     pinned to the account that owns this D1, but we filter on it
+	//     explicitly so a missing `domain` can never widen the blast
+	//     radius into another mailbox.
+	//   - `to_local IN (…)` — only when the caller narrows by
+	//     localpart (the emailbox multi-pick). Omitting `to` means
+	//     "every mailbox on this domain".
+	//
+	// Same snapshot → mutate → cache-update order as `read()`.
+	// The snapshot is a single GROUP BY over `to_email` that yields
+	// both the distinct mailbox list the cache update needs and the
+	// exact number of rows that flipped, so the UI can report
+	// "marked N read" without a second COUNT round trip.
+	//
+	// The cache update **zeroes** the counters rather than
+	// decrementing them: the scope is "every unread inbound row of
+	// these mailboxes", so once the rows are flipped there is
+	// provably nothing unread left and zero is the truth. Writing it
+	// outright is also what repairs a counter an older worker left
+	// wrong — the badge stuck above 0 after a previous "Mark all as
+	// read" is exactly the historical bug, and a second click clears
+	// it (see `unreadcountService.zeroCounts`).
+	//
+	// The mailbox list therefore comes from the **scope**, not from
+	// the snapshot: on that second click `rows` is empty (nothing
+	// unread is left to flip), so a snapshot-only write would skip
+	// precisely the mailboxes that need fixing.
+	//
+	// Returns `{ updated }` — the number of rows whose unread flag
+	// flipped, which is `0` when the scope was already fully read.
+	async readAll(c, params) {
+		const { domain, to } = params;
+
+		// `to_domain` is the IDOR boundary and is never optional. An
+		// omitted domain would flip every mailbox in this D1, so refuse
+		// instead of widening — the platform proxy always sends one
+		// (it resolves the domain name from the `domainId` it is
+		// given), which makes this a contract check rather than a
+		// user-facing guard.
+		if (!domain) {
+			throw new BizError('domain is required');
+		}
+
+		const conditions = [eq(email.type, 'receive'), eq(email.toDomain, domain)];
+		// The web proxy composes full `local@domain` addresses into the
+		// repeated `to` field (same shape as `/email/list`), but the
+		// `to_local` virtual column only stores the part before the
+		// `@`. Strip the domain so both shapes resolve against the
+		// same column.
+		const toLocals = Array.isArray(to)
+			? to
+					.map((s) => String(s ?? '').trim().split('@')[0].trim())
+					.filter(Boolean)
+			: [];
+		if (toLocals.length > 0) {
+			conditions.push(inArray(email.toLocal, toLocals));
+		}
+
+		// The unread predicate lives inside the scope, not just the
+		// snapshot, so the UPDATE is a genuine no-op on a mailbox that
+		// is already fully read and the two sides can never disagree
+		// about which rows were counted.
+		const scope = and(...conditions, eq(email.unread, EmailConst.unread.UNREAD));
+
+		const rows = await orm(c.env)
+			.select({ toEmail: email.toEmail, marked: count(email.id) })
+			.from(email)
+			.where(scope)
+			.groupBy(email.toEmail)
+			.all();
+
+		// Mailboxes this call is responsible for: everything the
+		// scope covers that carries a counter row, unioned with the
+		// snapshot (which is the subset that actually flipped). With a
+		// localpart filter the scope is exactly the picked mailboxes;
+		// unfiltered it is every mailbox the domain has tracked.
+		const scopedMailboxes =
+			toLocals.length > 0
+				? toLocals.map((lp) => `${lp}@${domain}`)
+				: Object.keys(await unreadcountService.listByDomain(c.env, domain));
+
+		await orm(c.env).update(email).set({ unread: EmailConst.unread.READ }).where(scope).run();
+		await unreadcountService.zeroCounts(c.env, [
+			...new Set([...rows.map((row) => row.toEmail), ...scopedMailboxes]),
+		]);
+
+		return { updated: rows.reduce((acc, row) => acc + Number(row.marked ?? 0), 0) };
+	},
+
 	// Inverse of `read()`: flips `unread = 1` for the given ids and
 	// bumps the per-mailbox counter via `batchedIncrement`. Same order
 	// as `read()` — mutate the row first, then update the cache — so
@@ -859,12 +1012,10 @@ const emailService = {
 	// additionally short-circuit here so a direct worker call
 	// can't issue a full-table scan.
 	async search(c, params) {
-		let { size } = params;
+		const size = resolvePageSize(params.size);
 		const { type, domain, emailId, to, q, field } = params;
 
-		size = Number(size);
 		const typeValue = type === 'send' ? 'send' : 'receive';
-		if (size > 30) size = 30;
 
 		const searchTerm = String(q ?? '').trim();
 		if (searchTerm.length < 2) {
