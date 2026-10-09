@@ -13,6 +13,7 @@ import cfEmailService from './cf-email-service';
 import starService from './star-service';
 import unreadcountService from './unreadcount-service';
 import { getR2Domain } from '../utils/r2-utils';
+import { toLocalParts } from '../utils/query-utils';
 import verifyUtils from '../utils/verify-utils';
 
 // ---------------------------------------------------------------------------
@@ -65,8 +66,26 @@ const emailService = {
 		const conditions = [eq(email.type, typeValue)];
 
 		// 处理 emailId：确保是有效的数字
+		//
+		// The cursor means "the oldest id the client already has" —
+		// the pager asks for the rows *after* it, which under
+		// `ORDER BY id DESC` are the **lower** ids. This used to be
+		// `gt`, which walked the list backwards: page 2 re-served the
+		// same rows as page 1 minus one, so "load more" appended
+		// duplicates instead of advancing. It never surfaced because
+		// the `size`-omitted path loaded the whole mailbox in one
+		// request (see `resolvePageSize`) and the platform's
+		// `loadMoreAvailable` was therefore permanently false.
+		// `starService.list` has always used `lt` + DESC for exactly
+		// this reason.
+		//
+		// The cursor is deliberately kept OUT of `conditions` so the
+		// `total` below counts the whole scope. Putting it in would
+		// make `total` shrink as the user pages down, and the pager's
+		// page count would fall out of range on page 2.
+		const cursorConditions = [];
 		if (emailId) {
-			conditions.push(gt(email.id, Number(emailId)));
+			cursorConditions.push(lt(email.id, Number(emailId)));
 		}
 
 		// Domain filter. The web proxy always passes a bare domain
@@ -91,12 +110,10 @@ const emailService = {
 		// can range-scan within `(to_domain, to_local)` on the
 		// compound partial index instead of pulling whole
 		// addresses. The split is the same shape as the index.
-		if (Array.isArray(to) && to.length > 0) {
-			const toList = to.map((s) => String(s ?? '').trim()).filter(Boolean);
-			if (toList.length > 0) {
-				const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
-				conditions.push(inArray(localColumn, toList));
-			}
+		const toLocals = toLocalParts(to);
+		if (toLocals.length > 0) {
+			const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
+			conditions.push(inArray(localColumn, toLocals));
 		}
 
 		// Starred filter (1.5.0). The web client used to page the
@@ -119,12 +136,16 @@ const emailService = {
 		const listQuery = orm(c.env)
 			.select()
 			.from(email)
-			.where(and(...conditions))
+			.where(and(...conditions, ...cursorConditions))
 			.orderBy(desc(email.id))
 			.limit(size)
 			.all();
 
 		// 统计和最新邮件查询需要添加 domain 条件
+		//
+		// Deliberately built from `conditions` alone (no cursor), so
+		// `total` is the size of the whole filtered mailbox and the
+		// pager's page count stays stable across pages.
 		const totalQuery = orm(c.env)
 			.select({ total: count(email.id) })
 			.from(email)
@@ -1024,8 +1045,11 @@ const emailService = {
 
 		const conditions = [eq(email.type, typeValue)];
 
+		// Cursor stays out of `conditions` so `total` keeps counting
+		// the whole match set — same reason as `list()`.
+		const cursorConditions = [];
 		if (emailId) {
-			conditions.push(gt(email.id, Number(emailId)));
+			cursorConditions.push(lt(email.id, Number(emailId)));
 		}
 
 		if (domain) {
@@ -1033,12 +1057,10 @@ const emailService = {
 			conditions.push(eq(domainColumn, domain));
 		}
 
-		if (Array.isArray(to) && to.length > 0) {
-			const toList = to.map((s) => String(s ?? '').trim()).filter(Boolean);
-			if (toList.length > 0) {
-				const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
-				conditions.push(inArray(localColumn, toList));
-			}
+		const toLocals = toLocalParts(to);
+		if (toLocals.length > 0) {
+			const localColumn = typeValue === 'send' ? email.fromLocal : email.toLocal;
+			conditions.push(inArray(localColumn, toLocals));
 		}
 
 		// Escape `%` / `_` / `\` so a literal underscore doesn't match
@@ -1070,7 +1092,7 @@ const emailService = {
 		const listQuery = orm(c.env)
 			.select()
 			.from(email)
-			.where(and(...conditions))
+			.where(and(...conditions, ...cursorConditions))
 			.orderBy(desc(email.id))
 			.limit(size)
 			.all();
@@ -1322,30 +1344,31 @@ const emailService = {
 		// always populated and we filter on `to_domain` /
 		// `to_local` (same compound partial-index path as the
 		// inbox list).
-		let { size } = params;
+		const size = resolvePageSize(params.size);
 		const { domain, emailId, to } = params;
 
-		size = Number(size);
-		if (size > 30) size = 30;
-
 		const conditions = [];
+		// Same cursor direction as `list()`: `emailId` is the oldest id
+		// the client already holds, and junk rows come back `id DESC`,
+		// so the next page is the set below it. Kept out of
+		// `conditions` so `total` stays the junk folder's full size.
+		const cursorConditions = [];
 		if (emailId) {
-			conditions.push(gt(junkEmail.id, Number(emailId)));
+			cursorConditions.push(lt(junkEmail.id, Number(emailId)));
 		}
 		if (domain) {
 			conditions.push(eq(junkEmail.toDomain, domain));
 		}
-		if (Array.isArray(to) && to.length > 0) {
-			const toList = to.map((s) => String(s ?? '').trim()).filter(Boolean);
-			if (toList.length > 0) {
-				conditions.push(inArray(junkEmail.toLocal, toList));
-			}
+		const toLocals = toLocalParts(to);
+		if (toLocals.length > 0) {
+			conditions.push(inArray(junkEmail.toLocal, toLocals));
 		}
 
+		const pageConditions = [...conditions, ...cursorConditions];
 		const listQuery = orm(c.env)
 			.select()
 			.from(junkEmail)
-			.where(conditions.length > 0 ? and(...conditions) : undefined)
+			.where(pageConditions.length > 0 ? and(...pageConditions) : undefined)
 			.orderBy(desc(junkEmail.id))
 			.limit(size)
 			.all();

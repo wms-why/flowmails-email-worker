@@ -8,6 +8,15 @@ app.get('/email/list', async (c) => {
   // (`?to=support@x&to=aa@x`). `c.req.query()` collapses repeats to
   // the last value, so pull it via `queries()` and merge into the
   // params bag the service destructures.
+  //
+  // `size` is the page cap (default 50, hard max 100 — see
+  // `resolvePageSize` in `email-service.js`) and `emailId` is the
+  // `id >` cursor the pager walks with. `starred=1` narrows to rows
+  // that carry a `star` row; both landed in 1.5.0, when the platform
+  // emailbox moved from "load the whole mailbox and page in the
+  // browser" to real server-side paging. `starred` needs no
+  // `VERSION_MIGRATION` entry — it reads the `star` table that has
+  // existed since 1.1.x and creates nothing.
   const params = c.req.query();
   const to = c.req.queries('to');
   const data = await emailService.list(c, { ...params, to });

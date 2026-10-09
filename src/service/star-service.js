@@ -6,6 +6,7 @@ import BizError from '../utils/biz-error';
 import { t } from '../i18n/i18n';
 import attService from './att-service';
 import emailService from './email-service';
+import { selectStarsByEmailIds } from '../utils/query-utils';
 const starService = {
 	async add(c, params) {
 		const { emailId } = params;
@@ -70,10 +71,10 @@ const starService = {
 	},
 
 	async selectByEmailIds(c, emailIds) {
-		if (!emailIds || emailIds.length === 0) {
-			return [];
-		}
-		return await orm(c.env).select().from(star).where(inArray(star.emailId, emailIds)).all();
+		// Chunked internally for the same D1 bind-variable ceiling as
+		// `attService.selectByEmailIds` — a full 100-row list page
+		// would otherwise exceed it and 500.
+		return selectStarsByEmailIds(c, star, emailIds);
 	},
 };
 

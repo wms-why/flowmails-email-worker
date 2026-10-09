@@ -4,6 +4,7 @@ import constant from '../const/constant';
 import { attach } from '../entity/att';
 import orm from '../entity/orm';
 import fileUtils from '../utils/file-utils';
+import { selectAttsByEmailIds } from '../utils/query-utils';
 import r2Service from './r2-service';
 
 const attService = {
@@ -167,11 +168,11 @@ const attService = {
 	},
 
 	selectByEmailIds(c, emailIds) {
-		return orm(c.env)
-			.select()
-			.from(attach)
-			.where(and(inArray(attach.emailId, emailIds), eq(attach.type, 'att')))
-			.all();
+		// Chunked internally: D1 caps a statement at 100 bind
+		// variables and a full list page carries up to 100 ids, so a
+		// single flat `inArray` 500s on exactly the largest page the
+		// pager can request. See `selectAttsByEmailIds`.
+		return selectAttsByEmailIds(c, attach, emailIds);
 	},
 
 	async removeAttByField(c, fieldName, fieldValues) {
