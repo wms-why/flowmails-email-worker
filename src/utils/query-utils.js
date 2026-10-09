@@ -85,22 +85,30 @@ export function toLocalParts(to) {
 }
 
 /**
- * Fetch attachment rows for a page of emails without exceeding D1's
- * bind-variable ceiling.
+ * Fetch rows of `table` matching a page of email ids, without exceeding
+ * D1's bind-variable ceiling.
+ *
+ * The shared chunk-and-flat half of both page lookups: attachments and
+ * stars are the same shape (a table, a `emailId IN (…)` predicate) and
+ * differ only in the extra `type = 'att'` filter attachments carry.
+ * Writing them as one function is what keeps the chunk size in a single
+ * place — if the two had drifted apart, one of them would start 500ing
+ * at exactly the largest page the pager can request.
  *
  * @param {any} c worker context (for the D1 binding)
- * @param {import('../entity/attach').attach} attach the `attach` table
+ * @param {any} table the Drizzle table to select from
  * @param {number[]} emailIds ids from one list page
- * @returns {Promise<object[]>} every `att`-type attachment on those ids
+ * @param {any[]} [extra] additional predicates, e.g. `eq(attach.type, 'att')`
+ * @returns {Promise<object[]>} every matching row across all chunks
  */
-export async function selectAttsByEmailIds(c, attach, emailIds) {
+async function selectByEmailIds(c, table, emailIds, extra = []) {
 	if (!Array.isArray(emailIds) || emailIds.length === 0) return [];
 	const batches = await Promise.all(
 		chunk(emailIds).map((ids) =>
 			orm(c.env)
 				.select()
-				.from(attach)
-				.where(and(inArray(attach.emailId, ids), eq(attach.type, 'att')))
+				.from(table)
+				.where(and(inArray(table.emailId, ids), ...extra))
 				.all(),
 		),
 	);
@@ -108,20 +116,28 @@ export async function selectAttsByEmailIds(c, attach, emailIds) {
 }
 
 /**
- * Star-row lookup for a page of emails, chunked for the same reason
- * as {@link selectAttsByEmailIds}.
+ * Attachment rows for a page of emails (`type = 'att'` only — inline
+ * `cid:` images are filtered out so the emailbox list doesn't
+ * double-count them).
+ *
+ * @param {any} c worker context
+ * @param {import('../entity/att').attach} attach the `attach` table
+ * @param {number[]} emailIds ids from one list page
+ * @returns {Promise<object[]>}
+ */
+export function selectAttsByEmailIds(c, attach, emailIds) {
+	return selectByEmailIds(c, attach, emailIds, [eq(attach.type, 'att')]);
+}
+
+/**
+ * Star rows for a page of emails, chunked for the same D1 bind-variable
+ * ceiling as {@link selectAttsByEmailIds}.
  *
  * @param {any} c worker context
  * @param {import('../entity/star').star} star the `star` table
  * @param {number[]} emailIds ids from one list page
  * @returns {Promise<object[]>}
  */
-export async function selectStarsByEmailIds(c, star, emailIds) {
-	if (!Array.isArray(emailIds) || emailIds.length === 0) return [];
-	const batches = await Promise.all(
-		chunk(emailIds).map((ids) =>
-			orm(c.env).select().from(star).where(inArray(star.emailId, ids)).all(),
-		),
-	);
-	return batches.flat();
+export function selectStarsByEmailIds(c, star, emailIds) {
+	return selectByEmailIds(c, star, emailIds);
 }

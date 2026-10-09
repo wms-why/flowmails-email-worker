@@ -259,6 +259,18 @@ export type EmailListRequest = EmailWorkerPaginationParams & {
    * `to_local IN (?, ?, …)` to stay inside the compound partial index.
    */
   to?: string[];
+  /**
+   * Send `"1"` to narrow the result to rows that carry a `star` row —
+   * the Starred mailbox. Omitted (or any other value) returns the
+   * unfiltered mailbox, with `isStar` set per row either way.
+   *
+   * Shipped in receive-worker 1.5.0; a 1.4.x worker ignores the param
+   * and returns the unfiltered mailbox, which is why the Starred tab
+   * narrowed on `isStar` in the browser before. The predicate rides
+   * the same filter set as `to` / `domain`, so on a starred request
+   * `total` is the **starred** count.
+   */
+  starred?: string;
 };
 
 /**
@@ -280,7 +292,91 @@ export type EmailListResponse = {
  * helper the caller picks. The proxy adds the bare `domain` query
  * param itself (resolved from `domainId`).
  */
-export type EmailListArgs = Omit<EmailListRequest, "to" | "domain" | "type"> & {
+export type EmailListArgs = Omit<
+  EmailListRequest,
+  "to" | "domain" | "type" | "starred"
+> & {
+  domainId: string;
+  /** Local parts (e.g. `["support", "sales"]`); the proxy composes `local@domain`. */
+  localparts?: string[];
+  /**
+   * Narrow to starred rows. A boolean here rather than the wire type's
+   * `"1"` string because this is the proxy-side call shape — only
+   * `listStarred` sets it, and `listMails` renders it into the query
+   * param. The param is omitted entirely when this is falsy, so a
+   * receive-worker older than 1.5.0 sees an unchanged request.
+   */
+  starred?: boolean;
+};
+
+// ---------------------------------------------------------------------------
+// /api/email/search (GET) — substring filter (no FTS5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which fields `EmailSearchRequest.q` matches against. `body` searches
+ * the plain-text and HTML columns; the others search the named address
+ * column and `subject`. The worker uses a SQL `LIKE %q%` post-filter
+ * applied after the indexed access path (`(to|from)_domain, id DESC`),
+ * so the call is O(scanned_page), not a full table scan — fine for
+ * personal mailboxes where the per-page window is bounded, and
+ * explicit about scaling limits so the next iteration can move to
+ * FTS5 (or a Rust extension) without changing the wire shape.
+ */
+export type EmailSearchField = "subject" | "from" | "to" | "body";
+
+/**
+ * Query parameters for `GET /api/email/search`. Same shape as
+ * {@link EmailListRequest} plus a required `q` and an optional
+ * `field` (default `"body"`, which searches subject + from + to +
+ * text + content).
+ */
+export type EmailSearchRequest = EmailWorkerPaginationParams & {
+  /** Mailbox direction. Anything other than `"send"` is treated as `"receive"`. */
+  type: EmailType;
+  /** Bare domain name (the indexed access path). */
+  domain: string;
+  /**
+   * Search query. Substring (case-insensitive `LIKE`); whitespace is
+   * collapsed to a single separator and the value is `trim()`-ed.
+   * A `q` shorter than 2 chars after trim is rejected at the
+   * action / proxy level so a stray keystroke doesn't issue a
+   * full-table scan.
+   */
+  q: string;
+  /**
+   * Field to match. Defaults to `"body"` — substring against
+   * `subject` OR `from_email` OR `to_email` OR `text` OR
+   * `content`. The other values restrict to a single column.
+   */
+  field?: EmailSearchField;
+  /**
+   * Same repeated `to=` shape as {@link EmailListRequest}; combined
+   * with `field="body"`, the local-part filter narrows **after**
+   * the LIKE so the indexed access path stays intact.
+   */
+  to?: string[];
+};
+
+/**
+ * Response payload for `/api/email/search`. Shape mirrors
+ * {@link EmailListResponse}. Each row is hydrated with `isStar` and
+ * `attList` so the search results can be opened in the reading pane
+ * without a second round trip.
+ */
+export type EmailSearchResponse = {
+  /** Page of rows in descending `id` order. */
+  list: EmailListRow[];
+  /** Total rows matching the filter (ignoring `size`). */
+  total: number;
+};
+
+/**
+ * Proxy-side args for {@link searchEmails}. The proxy adds the bare
+ * `domain` query param (from `domainId`); the `type` is required —
+ * the platform never wants to search both inbox and sent in one call.
+ */
+export type EmailSearchArgs = Omit<EmailSearchRequest, "to" | "domain"> & {
   domainId: string;
   /** Local parts (e.g. `["support", "sales"]`); the proxy composes `local@domain`. */
   localparts?: string[];
@@ -582,6 +678,81 @@ export type EmailReadRequest = {
 export type EmailReadResponse = Record<string, never>;
 
 // ---------------------------------------------------------------------------
+// /api/email/unread (PUT) — reverse of `/api/email/read`
+// ---------------------------------------------------------------------------
+
+/**
+ * Request body for `PUT /api/email/unread`. Inverse of {@link EmailReadRequest}.
+ *
+ * The action is inverts the read-side invariant: the worker first flips
+ * `email.unread = 1` for every matching row, then bumps the per-mailbox
+ * counter via `unreadcountService.batchedIncrement`. Order matters —
+ * mutating the `email` row first means a dropped cache update leaves the
+ * count high (recoverable on the next read) instead of low (a
+ * user-visible undercount). See `apps/email-worker/src/service/
+ * email-service.js#markUnread` and CLAUDE.md's `unreadcount` invariant.
+ */
+export type EmailUnreadRequest = {
+  /** Ids of the rows to flag as unread again. The worker ignores ids it can't find. */
+  emailIds: number[];
+};
+
+/** Response payload. The worker emits `data: null`. */
+export type EmailUnreadResponse = Record<string, never>;
+
+// ---------------------------------------------------------------------------
+// /api/email/readAll (PUT) — "mark all as read" over a mailbox scope
+// ---------------------------------------------------------------------------
+
+/**
+ * Request body for `PUT /api/email/readAll`. Added in receive-worker
+ * 1.4.1; a worker older than that answers a plain `404` on this path,
+ * which the platform proxy maps to a `ServiceError(409, …)` upgrade
+ * hint rather than a generic gateway error.
+ *
+ * Unlike {@link EmailReadRequest}, which takes an explicit id list and
+ * therefore can only ever cover the page the caller happens to hold,
+ * this endpoint takes the **same scope the inbox list is built from**
+ * and flips every unread inbound row inside it in one statement:
+ *
+ *   - only `type = 'receive'` rows are touched — outbound rows are
+ *     inserted with `unread = 0` and the unread cache is scoped to
+ *     inbound receives only (CLAUDE.md's `unreadcount` invariant);
+ *   - `domain` is the IDOR boundary and is always applied;
+ *   - `to` narrows to a set of recipient localparts (the emailbox
+ *     multi-pick). Omit it for "every mailbox on this domain".
+ *
+ * The worker keeps the `unreadcount` cache honest the same way
+ * {@link EmailReadRequest} does: snapshot the affected mailboxes,
+ * mutate the rows, then `batchedDecrement` — so a dropped cache write
+ * leaves the count high (recoverable) rather than low.
+ */
+export type EmailReadAllRequest = {
+  /** Bare domain name (no `@`) — the mailbox scope to clear. */
+  domain: string;
+  /**
+   * Optional localpart narrowing. The web proxy composes full
+   * `local@domain` addresses into this list (the same repeated `to=`
+   * field `/api/email/list` takes); the worker strips the domain back
+   * off before matching the `to_local` virtual column, so bare
+   * localparts work too.
+   */
+  to?: string[];
+};
+
+/**
+ * Response payload for {@link EmailReadAllRequest}.
+ *
+ * `updated` is the number of rows whose unread flag actually flipped —
+ * `0` when the scope was already fully read. The count comes from the
+ * same GROUP BY snapshot the cache update is driven by, so it is exact
+ * rather than inferred from the client's current page.
+ */
+export type EmailReadAllResponse = {
+  updated: number;
+};
+
+// ---------------------------------------------------------------------------
 // /api/email/delete (DELETE) and /api/email/batchDelete
 // ---------------------------------------------------------------------------
 
@@ -632,6 +803,23 @@ export type EmailAttachmentListRequest = {
  * the email and can compute it).
  */
 export type EmailAttachmentListResponse = AttachmentRow[];
+
+// ---------------------------------------------------------------------------
+// /api/email/countUnread (POST, multi-domain)
+// ---------------------------------------------------------------------------
+
+/** Request body for `POST /api/email/countUnread`. */
+export type EmailCountUnreadRequest = {
+  /** Domains to total. The worker caps each `IN (?, ?, …)` clause at 64 placeholders. */
+  domains: string[];
+};
+
+/**
+ * Response payload: per-domain total of unread rows. Domains in the
+ * request with no unreadcount rows are returned as `0` so callers
+ * can render a complete map.
+ */
+export type EmailCountUnreadResponse = Record<string, number>;
 
 // ---------------------------------------------------------------------------
 // Junk folder (1.2.0+).
@@ -685,10 +873,12 @@ export type EmailJunkListRow = {
 
   // Content
   subject: string | null;
+  /** Plain-text body. */
   text: string | null;
+  /** HTML body. */
   content: string | null;
 
-  // Multi-recipient metadata
+  // Multi-recipient metadata (JSON-encoded arrays)
   cc: string;
   bcc: string;
   recipient: string | null;
@@ -782,23 +972,6 @@ export type EmailJunkDeleteRequest = {
 
 /** Response payload for `/api/email/junkDelete`. The worker emits `data: null`. */
 export type EmailJunkDeleteResponse = Record<string, never>;
-
-// ---------------------------------------------------------------------------
-// /api/email/countUnread (POST, multi-domain)
-// ---------------------------------------------------------------------------
-
-/** Request body for `POST /api/email/countUnread`. */
-export type EmailCountUnreadRequest = {
-  /** Domains to total. The worker caps each `IN (?, ?, …)` clause at 64 placeholders. */
-  domains: string[];
-};
-
-/**
- * Response payload: per-domain total of unread rows. Domains in the
- * request with no unreadcount rows are returned as `0` so callers
- * can render a complete map.
- */
-export type EmailCountUnreadResponse = Record<string, number>;
 
 // ---------------------------------------------------------------------------
 // /api/email/countJunk (POST, multi-domain)

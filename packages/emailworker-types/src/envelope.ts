@@ -96,21 +96,38 @@ export type EmailWorkerHttpResponse = Response;
 // ---------------------------------------------------------------------------
 
 /**
- * Cursor pagination request. The worker's `list` / `latest` endpoints
- * take a `size` cap (capped at 30 server-side) and an `emailId`
- * cursor — when set, only rows with `id > emailId` are returned, so
- * callers page by walking the descending id list returned by the
- * previous call.
+ * Cursor pagination request. The worker's `list` / `search` /
+ * `junkList` endpoints take a `size` cap and an `emailId` cursor.
+ *
+ * Rows always come back `ORDER BY id DESC`, so `emailId` is the
+ * **oldest id the caller already holds** and the next page is the set
+ * *below* it — the worker applies `id < emailId`. (Before 1.5.0 this
+ * was `id > emailId`, which walked the list backwards and re-served
+ * the previous page; callers that omitted `size` never noticed
+ * because the LIMIT clause was dropped entirely.)
+ *
+ * Worker-side bounds, applied by `resolvePageSize` in
+ * `apps/email-worker/src/service/email-service.js`: `size` absent /
+ * non-positive / non-finite → 50 rows; anything above 100 is clamped
+ * down. Those two numbers are mirrored on the platform side in
+ * `apps/web/app/server/services/emailbox-paging.ts`
+ * (`DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE`), which the emailbox action,
+ * the `/api/emailbox/search` loader and the list footer picker all
+ * read — change one side without the other and the platform's pager
+ * divides by a page size the worker will never serve.
  */
 export type EmailWorkerPaginationParams = {
   /**
-   * Maximum number of rows to return. The worker silently clamps this
-   * to 30; callers don't need to enforce their own ceiling.
+   * Maximum number of rows to return. Absent, zero, negative and
+   * non-numeric values all mean "use the default page"; anything above
+   * the worker's max is silently clamped, so a caller must not assume
+   * it gets back exactly what it asked for.
    */
   size?: number;
   /**
-   * Cursor: only rows with `id > emailId` are returned. Omit on the
-   * first page.
+   * Cursor: only rows with `id < emailId` are returned, i.e. the page
+   * *older* than this id. Omit on the first page. Pass the smallest
+   * id from the previous page's rows.
    */
   emailId?: number;
 };
