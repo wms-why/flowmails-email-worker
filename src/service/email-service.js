@@ -387,6 +387,14 @@ const emailService = {
 		// swap it into the existing `EmailItem` slot without
 		// any field-name remapping.
 		//
+		// Two lookup keys, because two callers hold different ones:
+		// `emailId` (the numeric row id the dashboard renders) and
+		// `messageId` (the SMTP `Message-ID` the agent platform's
+		// event log records). The second was added in 1.5.1 — an
+		// agent that read an event has a `messageId` in hand and no
+		// row id, and without this it could not fetch the body the
+		// event was about.
+		//
 		// IDOR safety: the worker is per-account and the
 		// platform proxy only routes to a worker bound to the
 		// user's domain (`resolveEmailWorkerForDomain` checks
@@ -397,15 +405,28 @@ const emailService = {
 		// hint in the URL so a stale binding (e.g. a domain
 		// transferred to another account) can't leak rows
 		// across workers.
-		const { emailId, domain } = params;
-		const numericId = Number(emailId);
-		if (!numericId) {
-			throw new BizError('emailId is required');
-		}
+		const { emailId, messageId, domain } = params;
 		if (!domain) {
 			throw new BizError('domain is required');
 		}
-		const row = await this.selectById(c, numericId);
+
+		// Exactly one lookup key. A caller that sends both is
+		// ambiguous — resolving which one wins would be a policy
+		// the caller cannot see, so it is a caller bug.
+		if (emailId && messageId) {
+			throw new BizError('send either emailId or messageId, not both');
+		}
+
+		let row;
+		if (messageId) {
+			row = await this.selectByMessageId(c, messageId);
+		} else {
+			const numericId = Number(emailId);
+			if (!numericId) {
+				throw new BizError('emailId or messageId is required');
+			}
+			row = await this.selectById(c, numericId);
+		}
 		if (!row) {
 			throw new BizError(t('notExistEmailReply'));
 		}
@@ -803,6 +824,26 @@ const emailService = {
 
 	async selectById(c, emailId) {
 		return await orm(c.env).select().from(email).where(eq(email.id, emailId)).get();
+	},
+
+	/**
+	 * Look a row up by its SMTP `Message-ID` instead of its row id.
+	 *
+	 * The agent platform's event log records the SMTP `messageId`, not
+	 * the numeric row id — the worker writes the row, the platform
+	 * records the event, and the row id never crosses that boundary.
+	 * So an agent that read an event and wants the body has a
+	 * `messageId` in hand and no row id.
+	 *
+	 * `idx_email_message_id` (created in 1.1.x) makes this a single
+	 * indexed lookup. A message with no `Message-ID` header is stored
+	 * with an empty string; an empty query is rejected rather than
+	 * matching every such row.
+	 */
+	async selectByMessageId(c, messageId) {
+		const value = String(messageId ?? '').trim();
+		if (!value) return undefined;
+		return await orm(c.env).select().from(email).where(eq(email.messageId, value)).get();
 	},
 
 	async selectByIds(c, emailIds) {

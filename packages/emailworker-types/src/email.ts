@@ -475,9 +475,22 @@ export type EmailThreadResponse = {
  * `thread()` preview page has already shipped. The `domain` hint
  * is the IDOR check: the row's `toDomain` / `fromDomain` must
  * match it or the worker treats the row as not-found.
+ *
+ * **Exactly one** of `emailId` / `messageId` identifies the row.
+ *
+ * - `emailId` is the numeric row id, which the dashboard has because
+ *   it rendered the row.
+ * - `messageId` is the SMTP `Message-ID` (1.5.1), which is what the
+ *   agent platform's event log records. An agent that read an event
+ *   holds a `messageId` and no row id, so before this existed it
+ *   could see that a mail arrived but could not fetch what it said.
+ *
+ * Sending both is a caller bug and is rejected rather than resolved:
+ * which key wins would be a precedence the caller cannot see.
  */
 export type EmailGetRequest = {
-  emailId: number;
+  emailId?: number;
+  messageId?: string;
   /** Bare domain name (the same `domain` the thread endpoint receives). */
   domain: string;
 };
