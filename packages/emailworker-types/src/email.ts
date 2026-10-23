@@ -592,6 +592,27 @@ export type EmailSendRequest = {
    * `embed` attachments by the worker. */
   content?: string;
   /**
+   * Optional `Reply-To` header — where the recipient's reply should
+   * go, when it is not the `from` address.
+   *
+   * The header is set on the outbound envelope, so it is **not**
+   * stored as a column: the `from` address stays the address the row
+   * shows in the Sent tab, and `Reply-To` only steers the reply.
+   *
+   * Omit it and the worker sets no `Reply-To` at all — which is not
+   * the same as setting it to `from`. Cloudflare's Email Services
+   * defaults the header to the envelope sender when it is absent, so
+   * "unset" and "set to `from`" produce the same delivered header;
+   * the difference only matters when a caller wants replies to land
+   * somewhere other than the sending address.
+   *
+   * The worker rejects a malformed value with `BizError('notEmail')`
+   * rather than forwarding it, because Cloudflare's builder would
+   * otherwise drop the header silently and the caller would never
+   * learn that the reply went to the wrong place.
+   */
+  replyTo?: string;
+  /**
    * Pre-uploaded attachments. Each entry references an R2 key the
    * caller (or an earlier upload helper) has already written; the
    * worker inserts the metadata row and leaves the R2 object alone.

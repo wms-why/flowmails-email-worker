@@ -533,7 +533,7 @@ const emailService = {
 	// new send (worker stamps the SMTP-assigned `Message-ID` as the
 	// new thread root after the send returns).
 	async dispatchOutbound(c, params) {
-		const { from, fromName, to, manyType, subject, text, content, attachments, threading } = params;
+		const { from, fromName, to, manyType, subject, text, content, attachments, threading, replyTo } = params;
 
 		// Sender validation. The platform's `resolveFromAddress`
 		// already enforces localpart + domain + route-table rules;
@@ -576,6 +576,31 @@ const emailService = {
 		// `fromName` is optional. Fall back to the local-part of
 		// the address (capitalised) so the column is never blank.
 		const resolvedFromName = (fromName && fromName.trim()) || emailUtils.getName(fromValue) || null;
+
+		// `replyTo` is optional. When present it becomes the SMTP
+		// `Reply-To` header — where the recipient's reply lands,
+		// which is not always the sending address (a support desk
+		// that sends from `no-reply@` but wants replies at `support@`).
+		//
+		// Validated here rather than left to Cloudflare's builder: an
+		// invalid header value is dropped silently by the builder, so
+		// the caller would never learn the reply went to the wrong
+		// place. The worker's `from` check above is the same
+		// reasoning — a caller bug should surface as an error, not as
+		// a silently different email.
+		//
+		// Omitted → no `Reply-To` header at all. That is deliberately
+		// NOT the same as setting it to `from`: Cloudflare's Email
+		// Services defaults the header to the envelope sender when it
+		// is absent, so the two produce the same delivered header and
+		// only differ when the caller wants replies elsewhere.
+		let replyToValue;
+		if (replyTo !== undefined && replyTo !== null && replyTo !== '') {
+			replyToValue = String(replyTo).trim();
+			if (!verifyUtils.isEmail(replyToValue)) {
+				throw new BizError(t('notEmail'));
+			}
+		}
 
 		// `manyType: "divide"` yields one envelope per recipient
 		// (each can't see the others); default is a single envelope
@@ -660,6 +685,12 @@ const emailService = {
 				html: html || undefined,
 				attachments: [...imageDataList, ...(attachments || [])],
 			};
+			// `Reply-To` header. Only set when the caller named one —
+			// see the validation comment above for why "unset" is
+			// deliberately not the same as "set to `from`".
+			if (replyToValue) {
+				sendParams.replyTo = replyToValue;
+			}
 			// SMTP threading headers. The recipient's mail client
 			// uses these to thread the new message with the
 			// original conversation — `threading.threadId` is the
