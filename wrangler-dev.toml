@@ -53,6 +53,9 @@ domain = ["example.com"]
 admin = "admin@example.com"
 # Set to the dev classifier when working on the inbound spam path.
 # RSPAMD_CHECK_URL = ""
+# Set to the local web worker's event ingest door when working on the
+# event-spine producer. Unset → inbound events are not reported.
+# PLATFORM_INGEST_URL = "http://localhost:5173/api/events/ingest"
 
 # NOTE: no `[assets]` section. `src/index.js` falls through to
 # `env.assets.fetch(req)` for non-`/api` paths, so that branch needs the

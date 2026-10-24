@@ -5,6 +5,7 @@ import emailUtils from '../utils/email-utils';
 import fileUtils from '../utils/file-utils';
 import attService from './att-service';
 import emailService from './email-service';
+import eventIngestService from './event-ingest-service';
 import routeService from './route-service';
 import rspamdService from './rspamd-service';
 import { getR2Domain } from '../utils/r2-utils';
@@ -92,13 +93,30 @@ export async function email(message, env, ctx) {
 
 		emailRow = await emailService.completeReceive(env, EmailConst.status.RECEIVE, emailRow.id);
 
-		// Async Rspamd check. Runs after the SMTP receive has
-		// already returned (ctx.waitUntil is the platform's
-		// "don't block the request on this" hook). On
-		// `action === "reject"` the row is moved out of the
-		// live `email` table into `junk_email` — see
-		// `emailService.markAsJunk` for the safety reasoning.
+		// Report the accepted message to the platform's durable event
+		// log — the producer side of `POST /api/events/ingest`. The body
+		// and attachments stay in this worker's D1/R2. `reportInbound`
+		// never throws by design; the catch keeps a programming error
+		// from turning a successful receive into a failed one.
+		const eventReport = eventIngestService
+			.reportInbound(env, {
+				messageId: params.messageId,
+				recipient: message.to,
+				sender: params.fromEmail,
+				subject: params.subject,
+			})
+			.catch((err) => {
+				console.warn('[event-ingest] unexpected failure:', err instanceof Error ? err.message : err);
+			});
+
+		// Async work after the SMTP return. The Rspamd check may move
+		// the row out of the live `email` table into `junk_email` on
+		// `action === "reject"` — see `emailService.markAsJunk` for the
+		// safety reasoning. The event report is independent and fires in
+		// parallel: the log records that the message arrived, which is
+		// true whether or not the classifier later files it as junk.
 		if (ctx && typeof ctx.waitUntil === 'function') {
+			ctx.waitUntil(eventReport);
 			ctx.waitUntil(
 				runSpamCheck({
 					env,
@@ -108,6 +126,8 @@ export async function email(message, env, ctx) {
 					toEmail: message.to,
 				}),
 			);
+		} else {
+			await eventReport;
 		}
 
 		//转发到其他邮箱

@@ -22,6 +22,10 @@ export default defineWorkersConfig({
 					bindings: {
 						VERSION: '1.4.0',
 						JWT_SECRET: 'local-dev-jwt-secret',
+						// The event-ingest spec intercepts both URLs with
+						// `fetchMock`; the real endpoints are never called.
+						PLATFORM_INGEST_URL: 'https://platform.test/api/events/ingest',
+						RSPAMD_CHECK_URL: 'https://rspamd.test/api/check',
 					},
 				},
 			},
